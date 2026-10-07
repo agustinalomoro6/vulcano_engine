@@ -113,7 +113,7 @@ flowchart TD
 
 ## Requisitos
 
-- Python 3.14 o compatible.
+- Python 3.11 o superior (el código usa `except*` y `add_note`). Desarrollado y probado con Python 3.14.
 - Docker, para ejecutar LocalStack.
 - Dependencias indicadas en `requirements.txt`.
 
@@ -364,6 +364,18 @@ El logging registra información como:
 - `message_id`.
 - `indice`, cuando corresponde.
 
+El logger se llama `vulcano_engine` y es el mismo que usan `core_sqs.py` y
+`webhook_receiver.py`, por lo que todos sus mensajes llegan al archivo
+`vulcano.log`.
+
+### Rotación y compresión
+
+- El archivo rota al llegar a 2 MB.
+- Se conservan 3 respaldos comprimidos: `vulcano.log.1.gz`, `vulcano.log.2.gz` y `vulcano.log.3.gz`.
+- La compresión escribe primero un archivo temporal y luego lo renombra, para no dejar archivos `.gz` incompletos.
+
+### Excepciones en el log
+
 Las excepciones se almacenan de forma estructurada, incluyendo:
 
 - Tipo de excepción.
@@ -439,7 +451,7 @@ Los tests utilizan `moto` para simular los servicios de AWS necesarios durante l
 - Se utiliza `hmac.compare_digest()` para comparar firmas.
 - El logging utiliza un pipeline asíncrono mediante `QueueHandler`, `queue.Queue` y `QueueListener`.
 - Las excepciones se conservan y serializan estructuradamente.
-- Los logs rotados pueden comprimirse mediante Gzip.
+- Al rotar, los logs se comprimen en Gzip de forma atómica mediante los callbacks `namer` y `rotator` de `RotatingFileHandler`.
 - Las entradas recibidas por el CLI son validadas antes de utilizarse.
 
 ## Estado del proyecto
