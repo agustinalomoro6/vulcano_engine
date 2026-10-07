@@ -123,23 +123,22 @@ class RawQueueHandler(logging.handlers.QueueHandler):
         return record
 
 
-class GzipRotatingFileHandler(logging.handlers.RotatingFileHandler):
-    """Rota archivos y comprime los archivos rotados en Gzip."""
+def gzip_namer(default_name: str) -> str:
+    """Namer: los archivos rotados pasan a llamarse 'vulcano.log.N.gz'."""
+    return default_name + ".gz"
 
-    def doRollover(self) -> None:
-        super().doRollover()
 
-        for index in range(self.backupCount, 0, -1):
-            source = f"{self.baseFilename}.{index}"
-            if os.path.exists(source) and not source.endswith(".gz"):
-                destination = f"{source}.gz"
-                try:
-                    with open(source, "rb") as source_file:
-                        with gzip.open(destination, "wb") as gzip_file:
-                            shutil.copyfileobj(source_file, gzip_file)
-                    os.remove(source)
-                except OSError:
-                    pass
+def gzip_rotator(source: str, dest: str) -> None:
+    """Rotator: comprime 'source' en 'dest' de forma atomica.
+
+    Se escribe primero un archivo temporal y recien al terminar se
+    renombra con os.replace(), asi nunca queda un .gz a medio escribir.
+    """
+    tmp_dest = dest + ".tmp"
+    with open(source, "rb") as f_in, gzip.open(tmp_dest, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.replace(tmp_dest, dest)
+    os.remove(source)
 
 
 def setup_vulcano_logging(
@@ -149,19 +148,26 @@ def setup_vulcano_logging(
     # en 5 MB por default, y app_operator.py nunca lo sobreescribia).
     max_bytes: int = 2 * 1024 * 1024,
     backup_count: int = 3,
-    logger_name: str = "vulcano",
+    logger_name: str = "vulcano_engine",
 ) -> logging.Logger:
-    """Configura el logging asíncrono JSON de Vulcano."""
+    """Configura el logging asíncrono JSON de Vulcano.
+
+    El nombre por defecto del logger ("vulcano_engine") es el mismo que
+    usan core_sqs.py y webhook_receiver.py, para que sus mensajes lleguen
+    al archivo de log.
+    """
 
     log_queue: queue.Queue = queue.Queue()
     queue_handler = RawQueueHandler(log_queue)
 
-    file_handler = GzipRotatingFileHandler(
+    file_handler = logging.handlers.RotatingFileHandler(
         log_file,
         maxBytes=max_bytes,
         backupCount=backup_count,
         encoding="utf-8",
     )
+    file_handler.namer = gzip_namer
+    file_handler.rotator = gzip_rotator
     file_handler.setFormatter(AsyncJSONFormatter())
 
     listener = logging.handlers.QueueListener(
