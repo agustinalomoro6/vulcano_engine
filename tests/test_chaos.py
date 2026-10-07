@@ -125,3 +125,88 @@ class TestCaosCriptografico:
     def test_replay_attack_timestamp_viejo_se_rechaza(self):
         payload = b'{"amount": 100}'
         ts_viejo = int(time.time()) - 3600  # hace 1 hora
+        sig = generate_signature(self.SECRET, ts_viejo, payload)
+        with pytest.raises(WebhookTimestampError):
+            verify_signature(self.SECRET, f"t={ts_viejo},v1={sig}", payload)
+
+    def test_cabecera_malformada_se_rechaza(self):
+        with pytest.raises(WebhookSignatureError):
+            verify_signature(self.SECRET, "esto-no-tiene-el-formato-correcto", b"{}")
+
+    def test_cabecera_ausente_se_rechaza(self):
+        with pytest.raises(WebhookSignatureError):
+            verify_signature(self.SECRET, "", b"{}")
+
+
+# =====================================================================
+# Grupo 3 - Webhooks no autenticados contra el servidor HTTP real
+# (webhook_receiver.py, Integrante 3) y mensajes "veneno" en SQS
+# (core_sqs.py, Integrante 2)
+# =====================================================================
+
+class TestCaosEndToEnd:
+    """
+    Prueba el sistema completo: servidor HTTP + SQS (simulado con
+    moto, sin necesitar LocalStack corriendo).
+    """
+
+    SECRET = "mi_clave_secreta_super_segura_123"
+
+    @mock_aws
+    def test_webhook_firma_invalida_responde_401_y_no_publica_en_sqs(self):
+        from fastapi.testclient import TestClient
+
+        import vulcano_telemetry.webhook_receiver as receiver_mod
+
+        sqs = boto3.client("sqs", region_name="us-east-1")
+        queue_url = sqs.create_queue(QueueName="vulcano-events-queue")["QueueUrl"]
+        receiver_mod.get_sqs_client = lambda endpoint_url=None: sqs
+
+        app = receiver_mod.create_app(self.SECRET, queue_url)
+        client = TestClient(app)
+
+        payload = json.dumps({"transaction_id": "tx_ataque"}).encode()
+        response = client.post(
+            "/webhook",
+            content=payload,
+            headers={"X-Webhook-Signature": "t=1700000000,v1=firma_falsa"},
+        )
+
+        assert response.status_code == 401, (
+            "Un webhook con firma invalida debe ser rechazado con 401, "
+            f"pero respondio {response.status_code}"
+        )
+
+        mensajes = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
+        assert "Messages" not in mensajes, (
+            "Un webhook rechazado por firma invalida NUNCA debe llegar "
+            "a publicarse en SQS."
+        )
+
+    @mock_aws
+    def test_mensaje_veneno_en_sqs_no_tumba_el_resto_del_lote(self):
+        """
+        Cola con [valido, veneno, valido]: consume_events debe devolver
+        los 2 mensajes validos, omitir el corrupto y NO borrarlo (asi
+        SQS lo reintenta y termina en la DLQ).
+        """
+        from vulcano_telemetry.core_sqs import consume_events
+
+        sqs = boto3.client("sqs", region_name="us-east-1")
+        queue_url = sqs.create_queue(QueueName="vulcano-events-queue")["QueueUrl"]
+
+        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({"id": 1}))
+        sqs.send_message(QueueUrl=queue_url, MessageBody="esto-no-es-json{{{")
+        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({"id": 2}))
+
+        eventos = consume_events(sqs, queue_url, wait_time=1)
+
+        assert sorted(e["body"]["id"] for e in eventos) == [1, 2]
+
+        attrs = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["All"]
+        )["Attributes"]
+        total = int(attrs["ApproximateNumberOfMessages"]) + int(
+            attrs["ApproximateNumberOfMessagesNotVisible"]
+        )
+        assert total == 3, "El mensaje veneno no debe borrarse de la cola."

@@ -21,6 +21,7 @@ La solución también incorpora:
 - Logging asíncrono en formato JSON.
 - Registro estructurado de excepciones y causas encadenadas.
 - Rotación y compresión Gzip de archivos de log.
+- Dead Letter Queue (DLQ) para mensajes venenosos o no entregables.
 - Pruebas automatizadas con `pytest` y `moto`.
 
 ## Estructura del proyecto
@@ -37,6 +38,9 @@ vulcano_engine/
 │       ├── webhook_crypto.py
 │       ├── webhook_receiver.py
 │       └── logging_engine.py
+│
+├── infra/
+│   └── setup_queues.py
 │
 ├── tests/
 │   ├── test_chaos.py
@@ -57,6 +61,7 @@ vulcano_engine/
 | `webhook_receiver.py` | Recepción de Webhooks mediante FastAPI |
 | `logging_engine.py` | Logging JSON asíncrono, excepciones y rotación Gzip |
 | `app_operator.py` | Interfaz de línea de comandos |
+| `infra/setup_queues.py` | Crea `vulcano-events-queue`, `vulcano-events-dlq` y la `RedrivePolicy` |
 | `test_chaos.py` | Pruebas de validadores y seguridad criptográfica |
 | `test_forensic_log.py` | Pruebas de logging forense y rotación |
 
@@ -77,14 +82,17 @@ flowchart TD
     subgraph SQS["AWS SQS / LocalStack"]
         E --> F["vulcano-events-queue"]
         F --> H["consume_events()"]
+        F -->|"maxReceiveCount = 3<br/>(RedrivePolicy)"| DLQ["vulcano-events-dlq<br/>(Dead Letter Queue)"]
     end
 
     subgraph Dispatcher["app_operator.py"]
         H --> I["dispatch_webhook()<br/>Firma HMAC + HTTP POST"]
         I -->|Éxito| J["delete_event()"]
-        I -->|Error| K["Mensaje permanece<br/>para reintento"]
+        I -->|Error| K["Mensaje no se borra:<br/>SQS lo reintenta"]
+        H -->|"JSON corrupto<br/>(poison message)"| K
     end
 
+    K -.->|"supera maxReceiveCount"| DLQ
     I --> L["Servidor externo"]
 
     subgraph Logging["logging_engine.py"]
@@ -131,6 +139,9 @@ Instalar las dependencias:
 pip install -r requirements.txt
 ```
 
+> `requirements.txt` incluye `httpx2`, requerido por `starlette.testclient`
+> (usado por `TestClient` de FastAPI en los tests).
+
 ## LocalStack
 
 El proyecto utiliza LocalStack para emular AWS SQS localmente.
@@ -147,11 +158,53 @@ El endpoint utilizado por defecto es:
 http://localhost:4566
 ```
 
-La cola utilizada por defecto es:
+### Crear las colas (paso obligatorio)
 
-```text
-vulcano-events-queue
+Antes de usar cualquier subcomando hay que aprovisionar las colas. Con
+LocalStack levantado, ejecutar **una sola vez**:
+
+```bash
+python infra/setup_queues.py
 ```
+
+El script crea:
+
+| Recurso | Nombre | Detalle |
+|---|---|---|
+| Cola principal | `vulcano-events-queue` | `VisibilityTimeout=30`, con `RedrivePolicy` |
+| Dead Letter Queue | `vulcano-events-dlq` | Destino de los mensajes que fallan |
+
+Sin este paso los subcomandos fallan porque la cola no existe, y la cola
+principal no derivaría nada a la DLQ.
+
+## Dead Letter Queue (DLQ)
+
+La DLQ evita que un mensaje que siempre falla bloquee el procesamiento
+o se reintente indefinidamente.
+
+1. El dispatcher recibe el mensaje con Long Polling. SQS lo oculta
+   durante el `VisibilityTimeout` (30 s) e incrementa su contador de
+   recepciones.
+2. Solo si el webhook se entrega con éxito (respuesta HTTP < 400) se
+   llama a `delete_message`.
+3. Si la entrega falla, o si el cuerpo no es un JSON válido (*poison
+   message*), el mensaje **no se borra**. `consume_events` registra el
+   `CorruptedMessageError` en el log, omite ese mensaje y sigue con el
+   resto del lote.
+4. Tras el `VisibilityTimeout` SQS lo reentrega. Cuando el contador
+   supera `maxReceiveCount` (3, definido en la `RedrivePolicy`), SQS lo
+   mueve automáticamente a `vulcano-events-dlq`.
+
+Para inspeccionar la DLQ:
+
+```bash
+aws --endpoint-url=http://localhost:4566 sqs receive-message \
+    --queue-url http://localhost:4566/000000000000/vulcano-events-dlq \
+    --max-number-of-messages 10 --region us-east-1
+```
+
+Los mensajes de la DLQ se analizan y se corrigen manualmente; no se
+reprocesan de forma automática.
 
 ## Uso
 
@@ -207,11 +260,15 @@ El dispatcher consume eventos de SQS y los envía mediante Webhooks firmados.
 
 ## Argumentos globales
 
-| Argumento | Descripción | Valor por defecto |
-|---|---|---|
-| `--queue` | Nombre de la cola SQS | `vulcano-events-queue` |
-| `--secret` | Clave secreta HMAC | Configurada por la aplicación |
-| `--endpoint-url` | Endpoint de SQS / LocalStack | `http://localhost:4566` |
+| Argumento | Aplica a | Descripción | Valor por defecto |
+|---|---|---|---|
+| `--queue` | global | Nombre de la cola SQS | `vulcano-events-queue` |
+| `--secret` | global | Clave secreta HMAC (mín. 16 caracteres) | Configurada por la aplicación |
+| `--endpoint-url` | global | Endpoint de SQS / LocalStack | `http://localhost:4566` |
+| `--host`, `--port` | `start-receiver` | Dirección y puerto del receptor | `0.0.0.0`, `8000` |
+| `--target-url` | `start-dispatcher` | URL destino del webhook reenviado | `http://localhost:9000/incoming` |
+| `--wait-time` | `start-dispatcher` | Long Polling, 1 a 20 s | `10` |
+| `--max-iterations` | `start-dispatcher` | Ciclos de polling y termina (pruebas) | sin límite |
 
 ### Validación de entradas
 
@@ -372,12 +429,6 @@ Ejecutar todos los tests:
 python -m pytest tests/ -v
 ```
 
-Resultado actual de la suite:
-
-```text
-25 passed in 3.66s
-```
-
 Los tests utilizan `moto` para simular los servicios de AWS necesarios durante las pruebas, evitando depender de una instancia real de AWS.
 
 ## Reglas de diseño
@@ -393,17 +444,10 @@ Los tests utilizan `moto` para simular los servicios de AWS necesarios durante l
 
 ## Estado del proyecto
 
-Actualmente la suite automatizada se encuentra completamente aprobada:
-
-```text
-25 tests
-25 PASSED
-0 FAILED
-```
-
-El sistema ha sido verificado en:
+La suite se ejecuta con `python -m pytest tests/ -v`. Cubre:
 
 - Validación de entradas.
+- Mensajes venenosos sin pérdida del resto del lote.
 - Manejo de excepciones.
 - HMAC-SHA256.
 - Protección contra replay attacks.

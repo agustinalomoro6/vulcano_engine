@@ -1,7 +1,14 @@
 """
 logging_engine.py
------------------
-Integrante 4 - Observabilidad.
+-------------------
+Integrante 4 - Observabilidad: formateador JSON forense, pipeline no
+bloqueante (QueueHandler/QueueListener) y compresion Gzip al vuelo.
+
+NOTA DE DISENO: el logging.handlers.QueueHandler ESTANDAR de Python
+sobreescribe su metodo prepare() para renderizar el mensaje a texto y
+BORRA record.exc_info antes de encolar. RawQueueHandler, abajo,
+devuelve el LogRecord intacto para que el arbol de excepciones llegue
+completo hasta el AsyncJSONFormatter del otro lado de la cola.
 """
 
 from __future__ import annotations
@@ -16,6 +23,17 @@ import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+# Atributos "de fabrica" de un LogRecord: cualquier otra clave que
+# aparezca en record.__dict__ llego via extra={...} y se vuelca al
+# JSON tal cual, sin que cada desarrollador tenga que acordarse de
+# agregar un 'if hasattr(record, "mi_campo_nuevo")' cada vez.
+_CAMPOS_RESERVADOS = {
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName",
+    "processName", "process", "message", "taskName",
+}
+
 
 class AsyncJSONFormatter(logging.Formatter):
     """Convierte cada LogRecord en una línea JSON forense."""
@@ -25,7 +43,7 @@ class AsyncJSONFormatter(logging.Formatter):
         exc: Optional[BaseException],
         seen: Optional[set[int]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Serializa una excepción y sus causas."""
+        """Serializa una excepción, su cadena de causas y sus notas."""
 
         if exc is None:
             return None
@@ -34,55 +52,39 @@ class AsyncJSONFormatter(logging.Formatter):
             seen = set()
 
         exc_id = id(exc)
-
         if exc_id in seen:
-            return {
-                "type": type(exc).__name__,
-                "message": str(exc),
-            }
+            # Evita recursion infinita si una excepcion termina
+            # siendo su propia causa (ciclo), algo que en teoria no
+            # deberia pasar pero que no cuesta nada blindar.
+            return {"type": type(exc).__name__, "message": str(exc)}
 
         seen.add(exc_id)
 
         exception_data: Dict[str, Any] = {
             "type": type(exc).__name__,
             "message": str(exc),
+            # Campo estructurado para las notas agregadas con
+            # .add_note() -- ANTES solo quedaban mezcladas dentro del
+            # texto plano del traceback, dificiles de certificar
+            # automaticamente. Ahora son una lista propia.
+            "notes": list(getattr(exc, "__notes__", [])),
         }
 
         try:
-            traceback_text = "".join(
-                self.formatException(
-                    (
-                        type(exc),
-                        exc,
-                        exc.__traceback__,
-                    )
-                )
+            exception_data["traceback"] = "".join(
+                self.formatException((type(exc), exc, exc.__traceback__))
             )
-            exception_data["traceback"] = traceback_text
         except Exception:
             exception_data["traceback"] = None
 
-        # Causa explícita: raise X from Y
         if exc.__cause__ is not None:
-            exception_data["caused_by"] = self._serialize_exception(
-                exc.__cause__,
-                seen,
-            )
-
-        # Causa implícita.
+            exception_data["caused_by"] = self._serialize_exception(exc.__cause__, seen)
         elif exc.__context__ is not None and not exc.__suppress_context__:
-            exception_data["caused_by"] = self._serialize_exception(
-                exc.__context__,
-                seen,
-            )
+            exception_data["caused_by"] = self._serialize_exception(exc.__context__, seen)
 
-        # ExceptionGroup.
         if isinstance(exc, BaseExceptionGroup):
             exception_data["exceptions"] = [
-                self._serialize_exception(
-                    sub_exc,
-                    seen.copy(),
-                )
+                self._serialize_exception(sub_exc, seen.copy())
                 for sub_exc in exc.exceptions
             ]
 
@@ -100,32 +102,22 @@ class AsyncJSONFormatter(logging.Formatter):
             "thread_name": record.threadName,
         }
 
-        if hasattr(record, "event_id"):
-            data["event_id"] = record.event_id
+        # Cualquier campo pasado via extra={...} (trace_id, event_id,
+        # queue_name, message_id, webhook_id, indice, etc.) se vuelca
+        # automaticamente -- antes esto estaba hardcodeado a 4 campos
+        # fijos y 'trace_id' en particular se perdia en silencio.
+        for clave, valor in record.__dict__.items():
+            if clave not in _CAMPOS_RESERVADOS and not clave.startswith("_"):
+                data[clave] = valor
 
-        if hasattr(record, "queue_name"):
-            data["queue_name"] = record.queue_name
+        if record.exc_info and record.exc_info[1] is not None:
+            data["exception"] = self._serialize_exception(record.exc_info[1])
 
-        if hasattr(record, "message_id"):
-            data["message_id"] = record.message_id
-
-        if hasattr(record, "indice"):
-            data["indice"] = record.indice
-
-        if record.exc_info:
-            exception = record.exc_info[1]
-
-            if exception is not None:
-                data["exception"] = self._serialize_exception(exception)
-
-        return json.dumps(
-            data,
-            ensure_ascii=False,
-        )
+        return json.dumps(data, ensure_ascii=False, default=str)
 
 
 class RawQueueHandler(logging.handlers.QueueHandler):
-    """QueueHandler que conserva el LogRecord original."""
+    """QueueHandler que conserva el LogRecord original (exc_info incluido)."""
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
         return record
@@ -139,20 +131,13 @@ class GzipRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
         for index in range(self.backupCount, 0, -1):
             source = f"{self.baseFilename}.{index}"
-
             if os.path.exists(source) and not source.endswith(".gz"):
                 destination = f"{source}.gz"
-
                 try:
                     with open(source, "rb") as source_file:
                         with gzip.open(destination, "wb") as gzip_file:
-                            shutil.copyfileobj(
-                                source_file,
-                                gzip_file,
-                            )
-
+                            shutil.copyfileobj(source_file, gzip_file)
                     os.remove(source)
-
                 except OSError:
                     pass
 
@@ -160,14 +145,15 @@ class GzipRotatingFileHandler(logging.handlers.RotatingFileHandler):
 def setup_vulcano_logging(
     log_file: str = "vulcano.log",
     level: int = logging.INFO,
-    max_bytes: int = 5 * 1024 * 1024,
+    # 2 MB, tal como exige la consigna explicitamente (antes estaba
+    # en 5 MB por default, y app_operator.py nunca lo sobreescribia).
+    max_bytes: int = 2 * 1024 * 1024,
     backup_count: int = 3,
     logger_name: str = "vulcano",
 ) -> logging.Logger:
     """Configura el logging asíncrono JSON de Vulcano."""
 
     log_queue: queue.Queue = queue.Queue()
-
     queue_handler = RawQueueHandler(log_queue)
 
     file_handler = GzipRotatingFileHandler(
@@ -176,27 +162,20 @@ def setup_vulcano_logging(
         backupCount=backup_count,
         encoding="utf-8",
     )
-
     file_handler.setFormatter(AsyncJSONFormatter())
 
     listener = logging.handlers.QueueListener(
-        log_queue,
-        file_handler,
-        respect_handler_level=True,
+        log_queue, file_handler, respect_handler_level=True
     )
 
     logger = logging.getLogger(logger_name)
-
     logger.setLevel(level)
     logger.handlers.clear()
     logger.addHandler(queue_handler)
 
     listener.start()
 
-    # Permite detener el listener desde tests y otros componentes.
     logger.listener = listener  # type: ignore[attr-defined]
-
-    # Referencia interna.
     logger._vulcano_listener = listener  # type: ignore[attr-defined]
 
     return logger

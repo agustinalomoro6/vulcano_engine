@@ -7,4 +7,6 @@ requests>=2.31.0
 # Dependencias de desarrollo (tests)
 pytest>=8.0.0
 moto>=5.0.0
-httpx>=0.27.0
+# starlette.testclient (usado por TestClient de FastAPI) requiere httpx2;
+# usar el paquete viejo "httpx" esta deprecado y falla en starlette >= 1.x.
+httpx2>=2.0.0

@@ -101,13 +101,12 @@ def consume_events(
     """
     Consume mensajes de SQS aplicando Long Polling (WaitTimeSeconds).
 
-    Si el cuerpo de un mensaje no es JSON valido, se lanza
-    CorruptedMessageError para ese mensaje puntual -- la idea es que
-    un mensaje "veneno" (poison message) no tumbe el consumo de los
-    demas mensajes del lote, asi que el caller (app_operator.py) debe
-    decidir que hacer con ese mensaje individual (por ejemplo, no
-    borrarlo, para que SQS lo reintente y finalmente lo derive a la
-    Dead Letter Queue segun la RedrivePolicy configurada).
+    Si el cuerpo de un mensaje no es JSON valido (poison message), se
+    registra un CorruptedMessageError en el log y ese mensaje se omite
+    SIN borrarlo: el resto del lote se devuelve normalmente. SQS
+    reentrega el mensaje corrupto tras el VisibilityTimeout y, al
+    superar maxReceiveCount de la RedrivePolicy, lo deriva a la Dead
+    Letter Queue (vulcano-events-dlq).
 
     NO borra los mensajes automaticamente: el borrado explicito con
     delete_message() queda a cargo del llamador, una vez que confirma
@@ -143,7 +142,16 @@ def consume_events(
             )
             corrupt_err.add_note(f"MessageId: {msg.get('MessageId')}")
             corrupt_err.add_note(f"ReceiptHandle: {msg.get('ReceiptHandle')}")
-            raise corrupt_err from err
+            corrupt_err.__cause__ = err
+            # Poison message: se registra y se OMITE, pero NO se borra.
+            # SQS lo reentrega tras el VisibilityTimeout y, al superar
+            # maxReceiveCount, lo deriva a la DLQ.
+            logger.error(
+                "Mensaje veneno omitido; sera reintentado y derivado a la DLQ",
+                exc_info=(type(corrupt_err), corrupt_err, None),
+                extra={"message_id": msg.get("MessageId")},
+            )
+            continue
 
         procesados.append(
             {
