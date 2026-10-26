@@ -8,11 +8,16 @@ Subcomandos:
   start-receiver    Levanta el servidor HTTP receptor de Webhooks (uvicorn).
   start-dispatcher  Consume eventos de SQS y los reenvia como Webhooks
                     firmados al destino configurado.
+
+La clave secreta HMAC NO esta escrita en el codigo: se pasa con
+--secret o se lee de la variable de entorno VULCANO_WEBHOOK_SECRET.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,6 +45,8 @@ from vulcano_telemetry.exceptions import (  # noqa: E402
     CorruptedMessageError,
     SQSConnectionError,
     WebhookDeliveryError,
+    WebhookSignatureError,
+    WebhookTimestampError,
 )
 
 logger = setup_vulcano_logging()
@@ -59,8 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--secret",
         type=parse_secret_key,
-        default="mi_clave_secreta_super_segura_vulcano_123",
-        help="Clave secreta HMAC (minimo 16 caracteres).",
+        default=os.environ.get("VULCANO_WEBHOOK_SECRET"),
+        help="Clave secreta HMAC (minimo 16 caracteres). "
+             "Si no se indica, se lee de VULCANO_WEBHOOK_SECRET.",
     )
     parser.add_argument(
         "--endpoint-url",
@@ -125,8 +133,6 @@ def dispatch_webhook(target_url: str, secret: str, payload_dict: dict) -> reques
     Firma el payload con HMAC-SHA256 y lo reenvia por HTTP POST al
     destino configurado, inyectando la cabecera X-Webhook-Signature.
     """
-    import json
-
     payload_bytes = json.dumps(payload_dict).encode("utf-8")
     timestamp = int(time.time())
     signature = generate_signature(secret, timestamp, payload_bytes)
@@ -177,7 +183,21 @@ def cmd_start_dispatcher(args: argparse.Namespace) -> None:
         eventos = consume_events(sqs, queue_url, wait_time=args.wait_time)
 
         for evento in eventos:
-            response = dispatch_webhook(args.target_url, args.secret, evento["body"])
+            # Un destino caido NO debe tumbar al dispatcher: se registra
+            # el fallo, el mensaje NO se borra y se sigue con el
+            # proximo. SQS lo reentrega tras el VisibilityTimeout y, al
+            # superar maxReceiveCount, lo deriva a la DLQ.
+            try:
+                response = dispatch_webhook(args.target_url, args.secret, evento["body"])
+            except WebhookDeliveryError as err:
+                logger.warning(
+                    "Fallo la entrega del webhook; el mensaje NO se elimina "
+                    "y sera reintentado por SQS.",
+                    exc_info=(type(err), err, err.__traceback__),
+                    extra={"message_id": evento["message_id"]},
+                )
+                continue
+
             if response.status_code < 400:
                 delete_event(sqs, queue_url, evento["receipt_handle"])
                 logger.info(
@@ -192,32 +212,48 @@ def cmd_start_dispatcher(args: argparse.Namespace) -> None:
                 )
 
 
+def _reportar_grupo(titulo: str, grupo: BaseExceptionGroup) -> None:
+    """Escribe en el log cada excepcion de un grupo capturado con except*."""
+    logger.error(f"{titulo} ({len(grupo.exceptions)}):")
+    for exc in grupo.exceptions:
+        logger.error(f"  - {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.subcommand in ("start-receiver", "start-dispatcher") and not args.secret:
+        parser.error(
+            "Falta la clave secreta: use --secret o defina la variable "
+            "de entorno VULCANO_WEBHOOK_SECRET."
+        )
+
     logger.info(f"Iniciando VulcanoCLI, subcomando='{args.subcommand}'")
 
     exit_code = 0
     try:
         args.func(args)
 
-    except* WebhookDeliveryError as grupo:
+    except* WebhookSignatureError as grupo:
         exit_code = 1
-        logger.error(f"Errores al despachar Webhooks ({len(grupo.exceptions)}):")
-        for exc in grupo.exceptions:
-            logger.error(f"  - {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+        _reportar_grupo("Firmas HMAC invalidas o corruptas (posible falsificacion)", grupo)
+
+    except* WebhookTimestampError as grupo:
+        exit_code = 1
+        _reportar_grupo("Timestamps fuera de tolerancia (replay o reloj desincronizado)", grupo)
 
     except* SQSConnectionError as grupo:
         exit_code = 1
-        logger.error(f"Errores de comunicacion con SQS/LocalStack ({len(grupo.exceptions)}):")
-        for exc in grupo.exceptions:
-            logger.error(f"  - {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+        _reportar_grupo("Errores de comunicacion con SQS/LocalStack", grupo)
+
+    except* WebhookDeliveryError as grupo:
+        exit_code = 1
+        _reportar_grupo("Errores al despachar Webhooks", grupo)
 
     except* CorruptedMessageError as grupo:
         exit_code = 1
-        logger.error(f"Mensajes SQS corruptos detectados ({len(grupo.exceptions)}):")
-        for exc in grupo.exceptions:
-            logger.error(f"  - {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+        _reportar_grupo("Mensajes SQS corruptos detectados", grupo)
 
     finally:
         # Apagado ordenado del QueueListener. Sin return/break/continue

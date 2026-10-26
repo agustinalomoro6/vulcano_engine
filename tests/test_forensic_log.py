@@ -6,7 +6,7 @@ Integrante 6 - Validador forense de telemetria.
 Inspecciona de forma automatizada los logs generados por
 logging_engine.py: confirma que cada linea sea JSON valido, que
 contenga los campos de metadatos obligatorios (TraceId, MessageId
-cuando aplique), y que el arbol de excepciones (incluyendo
+y X-Webhook-Signature), y que el arbol de excepciones (incluyendo
 ExceptionGroup y causas encadenadas) se serialice correctamente, y
 que la rotacion + compresion Gzip funcione sin perdida de datos.
 
@@ -31,6 +31,7 @@ from vulcano_telemetry.exceptions import (  # noqa: E402
     WebhookSignatureError,
 )
 from vulcano_telemetry.logging_engine import setup_vulcano_logging  # noqa: E402
+from vulcano_telemetry.webhook_crypto import generate_signature  # noqa: E402
 
 
 @pytest.fixture
@@ -176,3 +177,58 @@ class TestRotacionYCompresion:
             "El archivo .gz se genero pero no contiene registros legibles "
             "-- posible perdida de datos en la compresion."
         )
+
+
+class TestCamposForensesEnGzip:
+    """Certifica que TraceId, MessageId y X-Webhook-Signature quedan
+    escritos en el log y SOBREVIVEN a la rotacion + compresion Gzip."""
+
+    def test_trace_message_y_firma_presentes_en_el_gz(self, tmp_path):
+        log_path = tmp_path / "forense_gz_test.log"
+        logger = setup_vulcano_logging(
+            str(log_path),
+            logger_name="test_forense_gz",
+            max_bytes=50_000,
+            backup_count=3,
+        )
+
+        secreto = "clave_de_prueba_larga_123"
+        timestamp = 1700000000
+        firma = generate_signature(secreto, timestamp, b'{"id": 1}')
+        cabecera = f"t={timestamp},v1={firma}"
+
+        # Registro "marcado": es el primero, asi que al rotar termina
+        # dentro del .gz.
+        logger.info(
+            "Webhook de prueba forense",
+            extra={
+                "trace_id": "trace-forense-001",
+                "message_id": "msg-forense-001",
+                "X-Webhook-Signature": cabecera,
+            },
+        )
+        # Relleno para forzar una rotacion.
+        for i in range(200):
+            logger.info("x" * 200, extra={"indice": i})
+
+        time.sleep(1.0)
+        logger.listener.stop()
+
+        archivos_gz = list(tmp_path.glob("*.gz"))
+        assert archivos_gz, "Se esperaba al menos un .gz tras la rotacion."
+
+        encontrado = None
+        for archivo in archivos_gz:
+            with gzip.open(archivo, "rt", encoding="utf-8") as f:
+                for linea in f:
+                    if linea.strip():
+                        registro = json.loads(linea)
+                        if registro.get("trace_id") == "trace-forense-001":
+                            encontrado = registro
+
+        assert encontrado is not None, (
+            "El registro marcado no aparece en ningun .gz: se perdio "
+            "informacion al comprimir."
+        )
+        assert encontrado["message_id"] == "msg-forense-001"
+        assert encontrado["X-Webhook-Signature"] == cabecera

@@ -208,6 +208,24 @@ reprocesan de forma automática.
 
 ## Uso
 
+### Configurar la clave secreta
+
+La clave HMAC no está escrita en el código. Se define con una variable de
+entorno (o con el argumento `--secret`) y es obligatoria para
+`start-receiver` y `start-dispatcher`.
+
+En Windows (PowerShell):
+
+```powershell
+$env:VULCANO_WEBHOOK_SECRET = "una_clave_larga_de_al_menos_16_caracteres"
+```
+
+En Linux / macOS:
+
+```bash
+export VULCANO_WEBHOOK_SECRET="una_clave_larga_de_al_menos_16_caracteres"
+```
+
 ### Mostrar la ayuda del CLI
 
 ```bash
@@ -263,7 +281,7 @@ El dispatcher consume eventos de SQS y los envía mediante Webhooks firmados.
 | Argumento | Aplica a | Descripción | Valor por defecto |
 |---|---|---|---|
 | `--queue` | global | Nombre de la cola SQS | `vulcano-events-queue` |
-| `--secret` | global | Clave secreta HMAC (mín. 16 caracteres) | Configurada por la aplicación |
+| `--secret` | global | Clave secreta HMAC (mín. 16 caracteres) | Variable de entorno `VULCANO_WEBHOOK_SECRET` |
 | `--endpoint-url` | global | Endpoint de SQS / LocalStack | `http://localhost:4566` |
 | `--host`, `--port` | `start-receiver` | Dirección y puerto del receptor | `0.0.0.0`, `8000` |
 | `--target-url` | `start-dispatcher` | URL destino del webhook reenviado | `http://localhost:9000/incoming` |
@@ -442,6 +460,11 @@ python -m pytest tests/ -v
 ```
 
 Los tests utilizan `moto` para simular los servicios de AWS necesarios durante las pruebas, evitando depender de una instancia real de AWS.
+
+Además de los validadores y la criptografía, la suite verifica que:
+
+- Un mensaje venenoso (JSON corrupto) se deriva automáticamente a `vulcano-events-dlq` tras superar `maxReceiveCount`.
+- `TraceId`, `MessageId` y `X-Webhook-Signature` se conservan dentro de los archivos `.log.gz` tras la rotación y compresión.
 
 ## Reglas de diseño
 

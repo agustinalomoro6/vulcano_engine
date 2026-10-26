@@ -210,3 +210,79 @@ class TestCaosEndToEnd:
             attrs["ApproximateNumberOfMessagesNotVisible"]
         )
         assert total == 3, "El mensaje veneno no debe borrarse de la cola."
+
+
+
+# =====================================================================
+# Grupo 4 - Dead Letter Queue (DLQ): derivacion automatica de mensajes
+# venenosos tras superar maxReceiveCount (RedrivePolicy)
+# =====================================================================
+
+class TestDeadLetterQueue:
+    """
+    Verifica de punta a punta que un mensaje veneno (JSON corrupto)
+    termina en 'vulcano-events-dlq' sin intervencion manual y que el
+    resto de los mensajes sigue procesandose con normalidad.
+    """
+
+    MAX_RECEIVE_COUNT = 2
+
+    @mock_aws
+    def test_mensaje_veneno_termina_en_la_dlq(self):
+        from vulcano_telemetry.core_sqs import consume_events
+
+        sqs = boto3.client("sqs", region_name="us-east-1")
+
+        # 1) Misma infraestructura que infra/setup_queues.py: DLQ + cola
+        #    principal con RedrivePolicy.
+        dlq_url = sqs.create_queue(QueueName="vulcano-events-dlq")["QueueUrl"]
+        dlq_arn = sqs.get_queue_attributes(
+            QueueUrl=dlq_url, AttributeNames=["QueueArn"]
+        )["Attributes"]["QueueArn"]
+
+        queue_url = sqs.create_queue(
+            QueueName="vulcano-events-queue",
+            Attributes={
+                "RedrivePolicy": json.dumps(
+                    {
+                        "deadLetterTargetArn": dlq_arn,
+                        "maxReceiveCount": self.MAX_RECEIVE_COUNT,
+                    }
+                ),
+            },
+        )["QueueUrl"]
+
+        # 2) Un mensaje valido y un mensaje veneno.
+        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({"id": 1}))
+        sqs.send_message(QueueUrl=queue_url, MessageBody="esto-no-es-json{{{")
+
+        # 3) El consumidor recibe varias veces. El valido se procesa y se
+        #    borra; el veneno se omite SIN borrar (visibility_timeout=0 lo
+        #    hace visible de inmediato, asi simulamos los reintentos).
+        for _ in range(self.MAX_RECEIVE_COUNT + 2):
+            eventos = consume_events(
+                sqs, queue_url, wait_time=0, visibility_timeout=0
+            )
+            for evento in eventos:
+                sqs.delete_message(
+                    QueueUrl=queue_url, ReceiptHandle=evento["receipt_handle"]
+                )
+
+        # 4) El veneno debe haber sido derivado a la DLQ.
+        respuesta = sqs.receive_message(
+            QueueUrl=dlq_url, MaxNumberOfMessages=10, WaitTimeSeconds=0
+        )
+        cuerpos = [m["Body"] for m in respuesta.get("Messages", [])]
+        assert cuerpos == ["esto-no-es-json{{{"], (
+            "El mensaje veneno debia derivarse automaticamente a "
+            "vulcano-events-dlq tras superar maxReceiveCount."
+        )
+
+        # 5) Y la cola principal quedo vacia (el valido se proceso).
+        attrs = sqs.get_queue_attributes(
+            QueueUrl=queue_url, AttributeNames=["All"]
+        )["Attributes"]
+        total = int(attrs["ApproximateNumberOfMessages"]) + int(
+            attrs["ApproximateNumberOfMessagesNotVisible"]
+        )
+        assert total == 0
