@@ -16,8 +16,8 @@ from __future__ import annotations
 class VulcanoError(Exception):
     """Excepcion base para todos los errores del ecosistema Vulcano."""
     def __init__(self, message: str, details: dict | None = None):
-    super().__init__(message)
-    self.details = details or {}
+        super().__init__(message)
+        self.details = details or {}
 
 
 # Dominio SQS (Integrante 2 - core_sqs.py)-
