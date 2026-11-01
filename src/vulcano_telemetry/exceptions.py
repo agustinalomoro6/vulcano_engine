@@ -11,7 +11,7 @@ dominio jamas deben vivir ahi arriba en la jerarquia.
 """
 
 from __future__ import annotations
-from typing import Any
+
 
 class VulcanoError(Exception):
     """Excepcion base para todos los errores del ecosistema Vulcano."""
