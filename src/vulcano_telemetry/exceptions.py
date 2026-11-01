@@ -11,15 +11,16 @@ dominio jamas deben vivir ahi arriba en la jerarquia.
 """
 
 from __future__ import annotations
-
+from typing import Any
 
 class VulcanoError(Exception):
     """Excepcion base para todos los errores del ecosistema Vulcano."""
+    def __init__(self, message: str, details: dict | None = None):
+    super().__init__(message)
+    self.details = details or {}
 
 
-# ---------------------------------------------------------------------
-# Dominio SQS (Integrante 2 - core_sqs.py)
-# ---------------------------------------------------------------------
+# Dominio SQS (Integrante 2 - core_sqs.py)-
 
 class SQSConnectionError(VulcanoError):
     """Fallo de red/transporte al comunicarse con SQS (LocalStack)."""
@@ -32,10 +33,7 @@ class QueueTimeoutError(VulcanoError):
 class CorruptedMessageError(VulcanoError):
     """El cuerpo de un mensaje SQS no es un JSON valido o esta mal formado."""
 
-
-# ---------------------------------------------------------------------
 # Dominio Webhook (Integrante 3 - webhook_crypto.py / webhook_receiver.py)
-# ---------------------------------------------------------------------
 
 class WebhookSignatureError(VulcanoError):
     """La firma HMAC-SHA256 del webhook es invalida, ausente o no coincide."""
