@@ -1,5 +1,7 @@
 # Vulcano Engine
 
+video de defensa: https://drive.google.com/file/d/1nYI9OAGMCWXpYyLZ15Q2FL5mHIOfnfu6/view?usp=drive_link
+
 Sistema de procesamiento de eventos con Webhooks firmados mediante **HMAC-SHA256** y mensajería asíncrona sobre **AWS SQS**, emulada localmente mediante **LocalStack**.
 
 El sistema incorpora validación de entradas, recepción de Webhooks, procesamiento mediante cola, despacho de eventos, manejo de excepciones y observabilidad no bloqueante mediante logs en formato JSON con rotación y compresión Gzip.
